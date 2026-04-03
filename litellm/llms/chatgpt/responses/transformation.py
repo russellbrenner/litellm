@@ -73,6 +73,19 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
+        # The ChatGPT backend rejects system-role messages in the input array.
+        # When a caller sends a system message whose content is a list of typed
+        # blocks (e.g. Claude Code), the bridge puts it into input as a
+        # {"type": "message", "role": "system", ...} item rather than extracting
+        # it into `instructions`. Strip those items here so the backend doesn't
+        # reject the request.
+        raw_input = request.get("input") or []
+        if isinstance(raw_input, list):
+            request["input"] = [
+                item for item in raw_input
+                if not (isinstance(item, dict) and item.get("role") == "system")
+            ]
+
         base_instructions = get_chatgpt_default_instructions()
         existing_instructions = request.get("instructions")
         if existing_instructions:
