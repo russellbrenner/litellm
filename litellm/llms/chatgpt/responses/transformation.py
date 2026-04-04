@@ -86,6 +86,22 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 if not (isinstance(item, dict) and item.get("role") == "system")
             ]
 
+        # The ChatGPT backend also rejects tool schemas missing a 'properties'
+        # field in their parameters object. Add empty properties for no-arg tools.
+        tools = request.get("tools") or []
+        if tools:
+            fixed_tools = []
+            for tool in tools:
+                params = tool.get("function", {}).get("parameters") or tool.get("parameters")
+                if isinstance(params, dict) and params.get("type") == "object" and params.get("properties") is None:
+                    fixed_params = dict(params, properties={})
+                    if "function" in tool:
+                        tool = dict(tool, function=dict(tool["function"], parameters=fixed_params))
+                    else:
+                        tool = dict(tool, parameters=fixed_params)
+                fixed_tools.append(tool)
+            request["tools"] = fixed_tools
+
         base_instructions = get_chatgpt_default_instructions()
         existing_instructions = request.get("instructions")
         if existing_instructions:
