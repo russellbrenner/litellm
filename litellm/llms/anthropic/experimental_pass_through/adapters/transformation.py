@@ -1383,8 +1383,8 @@ class LiteLLMAnthropicMessagesAdapter:
                 if len(thinking_blocks) > 0:
                     thinking_block = thinking_blocks[0]
                     if thinking_block["type"] == "thinking":
-                        thinking = thinking_block.get("thinking") or ""
-                        signature = thinking_block.get("signature") or ""
+                        thinking = str(thinking_block.get("thinking") or "")
+                        signature = str(thinking_block.get("signature") or "")
 
                         assert isinstance(thinking, str)
                         assert isinstance(signature, str)
@@ -1433,8 +1433,8 @@ class LiteLLMAnthropicMessagesAdapter:
                 if len(thinking_blocks) > 0:
                     for thinking_block in thinking_blocks:
                         if thinking_block["type"] == "thinking":
-                            thinking = thinking_block.get("thinking") or ""
-                            signature = thinking_block.get("signature") or ""
+                            thinking = str(thinking_block.get("thinking") or "")
+                            signature = str(thinking_block.get("signature") or "")
 
                             assert isinstance(thinking, str)
                             assert isinstance(signature, str)
