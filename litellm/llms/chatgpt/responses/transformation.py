@@ -1,6 +1,8 @@
 import json
 from typing import Any, Optional
 
+import litellm
+from litellm import ModelResponse
 from litellm.constants import STREAM_SSE_DONE_STRING
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -14,7 +16,7 @@ from litellm.types.llms.openai import (
     ResponsesAPIStreamEvents,
 )
 from litellm.types.router import GenericLiteLLMParams
-from litellm.types.utils import LlmProviders
+from litellm.types.utils import LlmProviders, Choices, Message
 from litellm.utils import CustomStreamWrapper
 
 from ..authenticator import Authenticator
@@ -219,6 +221,45 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         completed_response._hidden_params["additional_headers"] = processed_headers
         completed_response._hidden_params["headers"] = raw_headers
         return completed_response
+
+    def transform_response(
+        self,
+        model: str,
+        raw_response: Any,
+        logging_obj: Any,
+        messages: list,
+        print_verbose: Any,
+        encoding: Any,
+        api_key: Optional[str] = None,
+        json_mode: bool = False,
+        adhoc_tool_calls: bool = False,
+    ):
+        completed_response = self.transform_response_api_response(
+            model=model,
+            raw_response=raw_response,
+            logging_obj=logging_obj,
+        )
+        # The ChatGPT backend sometimes returns output: [] (empty response).
+        # The parent class raises ValueError for this. Return an empty
+        # text response instead so the caller gets a valid response.
+        if not completed_response.output:
+            model_response = ModelResponse()
+            model_response["model"] = model
+            message = Message(content="", role="assistant")
+            choice = Choices(index=0, message=message)
+            model_response["choices"] = [choice]
+            return model_response
+        return super().transform_response(
+            model=model,
+            raw_response=raw_response,
+            logging_obj=logging_obj,
+            messages=messages,
+            print_verbose=print_verbose,
+            encoding=encoding,
+            api_key=api_key,
+            json_mode=json_mode,
+            adhoc_tool_calls=adhoc_tool_calls,
+        )
 
     def get_complete_url(
         self,
