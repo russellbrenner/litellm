@@ -635,23 +635,19 @@ class TestGetToolsByNames:
 
 
 # ---------------------------------------------------------------------------
-# SemanticToolFilterHook — MCP/non-MCP split + ordering preservation
+# SemanticToolFilterHook — anthropic_messages call type allowlist
 # ---------------------------------------------------------------------------
-class _MockSemanticFilter:
-    """
-    Lightweight stub of SemanticMCPToolFilter for hook tests.
-
-    Avoids the embedding-model setup needed by the real filter and lets tests
-    assert directly on the inputs received by ``filter_tools``.
-    """
+class _AnthropicMessagesMockFilter:
+    """Lightweight stub used only by the anthropic_messages allowlist tests."""
 
     def __init__(self, top_k: int = 2):
         self.enabled = True
         self.top_k = top_k
-        self.received_tools = None
         self.received_query = None
+        self.call_count = 0
 
     def extract_user_query(self, messages):
+        # Anthropic-style content blocks (list of typed blocks).
         for m in reversed(messages):
             if m.get("role") == "user":
                 content = m.get("content", "")
@@ -664,139 +660,75 @@ class _MockSemanticFilter:
         return ""
 
     async def filter_tools(self, query, available_tools):
-        self.received_tools = available_tools
+        self.call_count += 1
         self.received_query = query
         return list(available_tools)[: self.top_k]
 
 
 @pytest.mark.asyncio
-async def test_semantic_filter_hook_filters_only_mcp_tools():
+async def test_semantic_filter_hook_runs_for_anthropic_messages():
     """
-    Only tools whose name starts with ``mcp__`` are semantically filtered.
-    Non-MCP tools (user-defined function tools, model-specific schemas)
-    are passed through untouched and must still be present in the output.
+    /v1/messages requests (call_type='anthropic_messages') used by Claude
+    Code and other Anthropic SDK clients must trigger the semantic filter
+    just like /v1/chat/completions. Before this fix the filter silently
+    skipped them, so every MCP tool was forwarded on every request.
     """
     from litellm.proxy.hooks.mcp_semantic_filter import SemanticToolFilterHook
 
-    mock_filter = _MockSemanticFilter(top_k=1)
+    mock_filter = _AnthropicMessagesMockFilter(top_k=2)
     hook = SemanticToolFilterHook(mock_filter)
 
-    user_tool = {"type": "function", "function": {"name": "user_lookup"}}
-    mcp_tool_1 = {"type": "function", "function": {"name": "mcp__email_send"}}
-    mcp_tool_2 = {"type": "function", "function": {"name": "mcp__calendar_create"}}
-    builtin_tool = {"type": "function", "function": {"name": "submit_form"}}
-
     data = {
-        "model": "gpt-4",
-        "messages": [{"role": "user", "content": "send email"}],
-        "tools": [user_tool, mcp_tool_1, mcp_tool_2, builtin_tool],
-        "metadata": {},
-    }
-
-    result = await hook.async_pre_call_hook(
-        user_api_key_dict=Mock(),
-        cache=Mock(),
-        data=data,
-        call_type="completion",
-    )
-
-    assert result is not None
-    out_names = [t["function"]["name"] for t in result["tools"]]
-
-    # filter_tools was called with only MCP tools
-    received_names = [
-        t["function"]["name"] for t in mock_filter.received_tools  # type: ignore
-    ]
-    assert received_names == ["mcp__email_send", "mcp__calendar_create"]
-
-    # Non-MCP tools survive the filter pass
-    assert "user_lookup" in out_names
-    assert "submit_form" in out_names
-
-    # Filtered MCP tool count is bounded by top_k
-    mcp_in_output = [n for n in out_names if n.startswith("mcp__")]
-    assert len(mcp_in_output) == 1
-
-
-@pytest.mark.asyncio
-async def test_semantic_filter_hook_preserves_original_tool_order():
-    """
-    The recombined tool list must preserve the caller's relative ordering of
-    non-MCP tools and place the filtered MCP block where the first MCP tool
-    originally sat. This guards against the naive
-    ``filtered_tools + passthrough_tools`` recombination that re-orders the
-    list and may break order-sensitive clients.
-    """
-    from litellm.proxy.hooks.mcp_semantic_filter import SemanticToolFilterHook
-
-    mock_filter = _MockSemanticFilter(top_k=2)
-    hook = SemanticToolFilterHook(mock_filter)
-
-    # Original layout: user, mcp_a, user2, mcp_b, builtin, mcp_c
-    # Expected: user, [filtered MCP block], user2, builtin
-    tools = [
-        {"type": "function", "function": {"name": "user_lookup"}},
-        {"type": "function", "function": {"name": "mcp__email_send"}},
-        {"type": "function", "function": {"name": "user_audit"}},
-        {"type": "function", "function": {"name": "mcp__calendar_create"}},
-        {"type": "function", "function": {"name": "submit_form"}},
-        {"type": "function", "function": {"name": "mcp__calendar_update"}},
-    ]
-    data = {
-        "model": "gpt-4",
-        "messages": [{"role": "user", "content": "send email"}],
-        "tools": tools,
-        "metadata": {},
-    }
-
-    result = await hook.async_pre_call_hook(
-        user_api_key_dict=Mock(),
-        cache=Mock(),
-        data=data,
-        call_type="completion",
-    )
-
-    assert result is not None
-    out_names = [t["function"]["name"] for t in result["tools"]]
-
-    # Non-MCP tools must appear in the same relative order as the input
-    non_mcp_positions = [
-        out_names.index(n) for n in ("user_lookup", "user_audit", "submit_form")
-    ]
-    assert non_mcp_positions == sorted(
-        non_mcp_positions
-    ), f"non-MCP tool order must be preserved, got {out_names}"
-
-    # The filtered MCP block must appear at position 1 (after user_lookup,
-    # before user_audit), matching the position of the first MCP tool in
-    # the original list.
-    assert out_names[0] == "user_lookup"
-    assert out_names[1].startswith("mcp__")
-
-
-@pytest.mark.asyncio
-async def test_semantic_filter_hook_skips_when_no_mcp_tools():
-    """
-    If the request only contains non-MCP tools, the hook must return None
-    rather than mutate the tool list. Non-MCP tools are out of scope for
-    semantic filtering.
-    """
-    from litellm.proxy.hooks.mcp_semantic_filter import SemanticToolFilterHook
-
-    hook = SemanticToolFilterHook(_MockSemanticFilter())
-
-    data = {
-        "messages": [{"role": "user", "content": "hi"}],
+        "model": "claude-3-5-sonnet",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "send an email"}],
+            }
+        ],
         "tools": [
-            {"type": "function", "function": {"name": "user_lookup"}},
-            {"type": "function", "function": {"name": "submit_form"}},
+            {"type": "function", "function": {"name": "email_send"}},
+            {"type": "function", "function": {"name": "calendar_create"}},
+            {"type": "function", "function": {"name": "calendar_update"}},
         ],
         "metadata": {},
     }
+
     result = await hook.async_pre_call_hook(
         user_api_key_dict=Mock(),
         cache=Mock(),
         data=data,
-        call_type="completion",
+        call_type="anthropic_messages",
+    )
+
+    assert result is not None, "hook must run for anthropic_messages call type"
+    assert mock_filter.call_count == 1
+    assert mock_filter.received_query == "send an email"
+    assert len(result["tools"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_semantic_filter_hook_skips_non_allowlisted_call_type():
+    """
+    Hook must remain a no-op for call types that are not on the allowlist.
+    Adding `anthropic_messages` must not silently widen the allowlist to
+    every call type.
+    """
+    from litellm.proxy.hooks.mcp_semantic_filter import SemanticToolFilterHook
+
+    mock_filter = _AnthropicMessagesMockFilter()
+    hook = SemanticToolFilterHook(mock_filter)
+
+    data = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "function": {"name": "t1"}}],
+        "metadata": {},
+    }
+    result = await hook.async_pre_call_hook(
+        user_api_key_dict=Mock(),
+        cache=Mock(),
+        data=data,
+        call_type="image_generation",
     )
     assert result is None
+    assert mock_filter.call_count == 0
