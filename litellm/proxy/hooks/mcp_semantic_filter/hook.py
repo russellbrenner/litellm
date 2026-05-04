@@ -96,20 +96,11 @@ class SemanticToolFilterHook(CustomLogger):
         for tool in openai_tools:
             if hasattr(tool, "model_dump"):
                 tool_dict = tool.model_dump(exclude_none=True)
-                verbose_proxy_logger.debug(
-                    f"Converted Pydantic tool to dict: {type(tool).__name__} -> dict with keys: {list(tool_dict.keys())}"
-                )
                 openai_tools_as_dicts.append(tool_dict)
             elif hasattr(tool, "dict"):
                 tool_dict = tool.dict(exclude_none=True)
-                verbose_proxy_logger.debug(
-                    f"Converted Pydantic tool (v1) to dict: {type(tool).__name__} -> dict"
-                )
                 openai_tools_as_dicts.append(tool_dict)
             elif isinstance(tool, dict):
-                verbose_proxy_logger.debug(
-                    f"Tool is already a dict with keys: {list(tool.keys())}"
-                )
                 openai_tools_as_dicts.append(tool)
             else:
                 verbose_proxy_logger.warning(
@@ -117,11 +108,45 @@ class SemanticToolFilterHook(CustomLogger):
                 )
                 openai_tools_as_dicts.append(tool)
 
+        # `_process_mcp_tools_to_openai_format` defaults to the OpenAI Responses
+        # API shape (flat: {type, name, description, parameters}). That's wrong
+        # for callers routed through `litellm.completion` and the providers it
+        # talks to (Anthropic, OpenAI Chat, etc.), which all expect Chat shape
+        # ({type: "function", function: {name, description, parameters}}).
+        # Without this rewrap, AnthropicConfig.map_openai_params crashes with
+        # KeyError: 'function' on the very first tool.
+        # Detect tools that are already Chat-shape (have "function" key) and
+        # leave them alone; rewrap the rest.
+        normalized: List[Dict[str, Any]] = []
+        for tool in openai_tools_as_dicts:
+            if not isinstance(tool, dict):
+                normalized.append(tool)
+                continue
+            if "function" in tool:
+                normalized.append(tool)
+                continue
+            # Flat Responses-API shape -> Chat-completions shape
+            name = tool.get("name", "")
+            if not name:
+                normalized.append(tool)
+                continue
+            normalized.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    },
+                }
+            )
+
         verbose_proxy_logger.debug(
-            f"Expanded {len(mcp_tools)} MCP reference(s) to {len(openai_tools_as_dicts)} tools (all as dicts)"
+            f"Expanded {len(mcp_tools)} MCP reference(s) to {len(normalized)} tools "
+            f"(chat-shape={sum(1 for t in normalized if isinstance(t, dict) and 'function' in t)})"
         )
 
-        return openai_tools_as_dicts
+        return normalized
 
     def _get_metadata_variable_name(self, data: dict) -> str:
         if "litellm_metadata" in data:
@@ -370,17 +395,24 @@ class SemanticToolFilterHook(CustomLogger):
         return headers
 
     def _get_tool_names_csv(self, tools: List[Any]) -> str:
-        """Extract tool names and return as CSV string."""
+        """Extract tool names and return as CSV string.
+
+        Handles both flat Responses-API shape (`{name, ...}`) and Chat-shape
+        (`{type: function, function: {name, ...}}`). After the chat-shape
+        rewrap in `_expand_mcp_tools` most tools land here with the nested
+        form; the flat fallback covers tools that arrive pre-shaped.
+        """
         if not tools:
             return ""
 
         tool_names = []
         for tool in tools:
-            name = (
-                tool.get("name", "")
-                if isinstance(tool, dict)
-                else getattr(tool, "name", "")
-            )
+            if isinstance(tool, dict):
+                name = tool.get("function", {}).get("name", "") or tool.get(
+                    "name", ""
+                )
+            else:
+                name = getattr(tool, "name", "")
             if name:
                 tool_names.append(name)
 
