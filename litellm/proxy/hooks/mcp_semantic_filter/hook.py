@@ -202,6 +202,16 @@ class SemanticToolFilterHook(CustomLogger):
             verbose_proxy_logger.debug("No tools in request, skipping semantic filter")
             return None
 
+        # When the request only carries an MCP gateway reference (the
+        # `server_url=litellm_proxy` shape) the proxy expands it here. We then
+        # know every resulting tool is from an MCP server, regardless of the
+        # tool name prefix the LiteLLM gateway uses (`<server>-<tool>` by
+        # default via MCP_TOOL_PREFIX_SEPARATOR; `mcp__` only applies to client-
+        # side prefixed tools like the ones Claude Code attaches itself).
+        # In that case we treat every tool as MCP, otherwise we fall back to
+        # the prefix-based split below.
+        expanded_from_gateway = False
+
         # Check for MCP references (server_url="litellm_proxy") and expand them
         if self._should_expand_mcp_tools(tools):
             verbose_proxy_logger.debug(
@@ -223,6 +233,7 @@ class SemanticToolFilterHook(CustomLogger):
 
                 # Update tools for filtering
                 tools = expanded_tools
+                expanded_from_gateway = True
 
             except Exception as e:
                 verbose_proxy_logger.error(
@@ -254,24 +265,29 @@ class SemanticToolFilterHook(CustomLogger):
                 )
                 return None
 
-            # Only semantically filter MCP gateway tools — identified by the
-            # "mcp__" name prefix assigned by the LiteLLM proxy. Non-MCP tools
-            # (user-defined function tools, model-specific tool schemas) are
-            # passed through untouched so they are never inadvertently dropped.
-            # Track original positions so the recombined list preserves the
-            # caller's tool ordering for any model that is order-sensitive.
+            # Decide which subset of tools is MCP. Two paths:
+            # 1. Tools were just expanded by this hook from a litellm_proxy
+            #    gateway reference — every resulting tool is MCP, so skip the
+            #    prefix split. The LiteLLM gateway prefixes tools as
+            #    `<server>-<tool>` by default which would never match `mcp__`.
+            # 2. Tools came in pre-expanded — likely from a Claude-Code-style
+            #    client that prefixes its own MCP tools with `mcp__`. Use the
+            #    prefix to keep user-defined function tools out of the filter.
             mcp_tools = []
             passthrough_with_positions = []
-            for idx, t in enumerate(tools):
-                name = (
-                    t.get("function", {}).get("name", "") or t.get("name", "")
-                    if isinstance(t, dict)
-                    else getattr(t, "name", "")
-                )
-                if name.startswith("mcp__"):
-                    mcp_tools.append(t)
-                else:
-                    passthrough_with_positions.append((idx, t))
+            if expanded_from_gateway:
+                mcp_tools = list(tools)
+            else:
+                for idx, t in enumerate(tools):
+                    name = (
+                        t.get("function", {}).get("name", "") or t.get("name", "")
+                        if isinstance(t, dict)
+                        else getattr(t, "name", "")
+                    )
+                    if name.startswith("mcp__"):
+                        mcp_tools.append(t)
+                    else:
+                        passthrough_with_positions.append((idx, t))
 
             if not mcp_tools:
                 verbose_proxy_logger.debug(
