@@ -108,24 +108,38 @@ class SemanticToolFilterHook(CustomLogger):
                 )
                 openai_tools_as_dicts.append(tool)
 
-        # `_process_mcp_tools_to_openai_format` defaults to the OpenAI Responses
-        # API shape (flat: {type, name, description, parameters}). That's wrong
-        # for callers routed through `litellm.completion` and the providers it
-        # talks to (Anthropic, OpenAI Chat, etc.), which all expect Chat shape
+        # NOTE on shape: `_process_mcp_tools_to_openai_format` defaults to the
+        # OpenAI Responses API shape (flat: {type, name, description,
+        # parameters}). The downstream provider configs (e.g.
+        # AnthropicConfig.map_openai_params) expect OpenAI Chat shape
         # ({type: "function", function: {name, description, parameters}}).
-        # Without this rewrap, AnthropicConfig.map_openai_params crashes with
-        # KeyError: 'function' on the very first tool.
-        # Detect tools that are already Chat-shape (have "function" key) and
-        # leave them alone; rewrap the rest.
-        normalized: List[Dict[str, Any]] = []
-        for tool in openai_tools_as_dicts:
+        # We *don't* rewrap here — the SemanticMCPToolFilter reads tool name
+        # from `tool["name"]` directly when ranking, which only works on flat
+        # shape. The chat-shape rewrap happens after the filter has selected
+        # its top-K, in `_chat_shape_for_completion` invoked from the main
+        # hook before assigning back to `data["tools"]`.
+
+        verbose_proxy_logger.debug(
+            f"Expanded {len(mcp_tools)} MCP reference(s) to {len(openai_tools_as_dicts)} tools (flat shape)"
+        )
+
+        return openai_tools_as_dicts
+
+    @staticmethod
+    def _chat_shape_for_completion(tools: List[Any]) -> List[Any]:
+        """Convert flat Responses-API tool dicts to OpenAI Chat-completions
+        shape so ``AnthropicConfig.map_openai_params`` and friends can consume
+        them. Tools already carrying a top-level ``function`` key are left
+        unchanged so callers that pre-shape their tools aren't disturbed.
+        """
+        normalized: List[Any] = []
+        for tool in tools:
             if not isinstance(tool, dict):
                 normalized.append(tool)
                 continue
             if "function" in tool:
                 normalized.append(tool)
                 continue
-            # Flat Responses-API shape -> Chat-completions shape
             name = tool.get("name", "")
             if not name:
                 normalized.append(tool)
@@ -140,12 +154,6 @@ class SemanticToolFilterHook(CustomLogger):
                     },
                 }
             )
-
-        verbose_proxy_logger.debug(
-            f"Expanded {len(mcp_tools)} MCP reference(s) to {len(normalized)} tools "
-            f"(chat-shape={sum(1 for t in normalized if isinstance(t, dict) and 'function' in t)})"
-        )
-
         return normalized
 
     def _get_metadata_variable_name(self, data: dict) -> str:
@@ -332,10 +340,17 @@ class SemanticToolFilterHook(CustomLogger):
                 available_tools=mcp_tools,  # type: ignore
             )
 
+            # Rewrap the surviving MCP tools to OpenAI Chat-completions shape
+            # so downstream provider configs (Anthropic, OpenAI Chat, etc.)
+            # don't crash on the flat Responses-API shape that the gateway
+            # expander emits. Done after filtering so the filter can read
+            # tool names from the flat shape.
+            chat_shape_filtered = self._chat_shape_for_completion(filtered_tools)
+
             # Recombine while preserving the caller's original ordering.
             data["tools"] = self._recombine_preserving_order(
                 original_count=len(tools),
-                filtered_mcp_tools=filtered_tools,
+                filtered_mcp_tools=chat_shape_filtered,
                 passthrough_with_positions=passthrough_with_positions,
             )
 
