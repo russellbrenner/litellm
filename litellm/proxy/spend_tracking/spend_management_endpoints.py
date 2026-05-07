@@ -1754,7 +1754,7 @@ async def ui_view_spend_logs(  # noqa: PLR0915
     ),
     sort_by: str = fastapi.Query(
         default="startTime",
-        description="Sort logs by field: spend, total_tokens, startTime, or endTime",
+        description="Sort logs by field: spend, total_tokens, startTime, endTime, request_duration_ms, model, or ttft_ms",
     ),
     sort_order: Optional[str] = fastapi.Query(
         default="desc",
@@ -1798,6 +1798,8 @@ async def ui_view_spend_logs(  # noqa: PLR0915
         "startTime",
         "endTime",
         "request_duration_ms",
+        "model",
+        "ttft_ms",
     }
     if sort_by not in valid_sort_fields:
         raise ProxyException(
@@ -2045,13 +2047,26 @@ async def ui_view_spend_logs(  # noqa: PLR0915
             sql_params.append(f"%{error_message}%")
             p += 1
 
-        # Quote column names that need quoting in SQL
-        _sql_col = (
-            f'"{order_column}"'
-            if order_column in ("startTime", "endTime")
-            else order_column
-        )
+        # Build the ORDER BY expression. ttft_ms is computed from
+        # completionStartTime - startTime; non-streaming rows (where
+        # completionStartTime is null or equals endTime) yield NULL, so we
+        # append NULLS LAST in that case to keep them at the bottom regardless
+        # of direction. The other sort columns are non-null in the result set,
+        # so we leave the NULLS clause off and preserve their existing DESC
+        # semantics.
         _sql_dir = "ASC" if order_direction == "asc" else "DESC"
+        _nulls_clause = ""
+        if order_column == "ttft_ms":
+            _order_expr = (
+                'CASE WHEN "completionStartTime" IS NULL '
+                'OR "completionStartTime" = "endTime" THEN NULL '
+                'ELSE (EXTRACT(EPOCH FROM ("completionStartTime" - "startTime")) * 1000) END'
+            )
+            _nulls_clause = " NULLS LAST"
+        elif order_column in ("startTime", "endTime"):
+            _order_expr = f'"{order_column}"'
+        else:
+            _order_expr = order_column
 
         sql_query = f"""
             SELECT
@@ -2065,7 +2080,7 @@ async def ui_view_spend_logs(  # noqa: PLR0915
                 COALESCE(request_duration_ms, (EXTRACT(EPOCH FROM ("endTime" - "startTime")) * 1000)::INTEGER) AS request_duration_ms
             FROM "LiteLLM_SpendLogs"
             WHERE {" AND ".join(sql_conditions)}
-            ORDER BY {_sql_col} {_sql_dir}
+            ORDER BY {_order_expr} {_sql_dir}{_nulls_clause}
             LIMIT ${p} OFFSET ${p + 1}
         """
         sql_params.extend([page_size, skip])
@@ -2297,10 +2312,13 @@ async def view_spend_logs(  # noqa: PLR0915
             }
 
             if api_key is not None and isinstance(api_key, str):
-                filter_query["api_key"] = api_key  # type: ignore
-            elif request_id is not None and isinstance(request_id, str):
+                if api_key.startswith("sk-"):
+                    filter_query["api_key"] = prisma_client.hash_token(token=api_key)  # type: ignore
+                else:
+                    filter_query["api_key"] = api_key  # type: ignore
+            if request_id is not None and isinstance(request_id, str):
                 filter_query["request_id"] = request_id  # type: ignore
-            elif user_id is not None and isinstance(user_id, str):
+            if user_id is not None and isinstance(user_id, str):
                 filter_query["user"] = user_id  # type: ignore
 
             # Check if user wants unsummarized data
@@ -2375,49 +2393,30 @@ async def view_spend_logs(  # noqa: PLR0915
 
             return response
 
-        elif api_key is not None and isinstance(api_key, str):
-            if api_key.startswith("sk-"):
-                hashed_token = prisma_client.hash_token(token=api_key)
-            else:
-                hashed_token = api_key
-            spend_log = await prisma_client.get_data(
-                table_name="spend",
-                query_type="find_all",
-                key_val={"key": "api_key", "value": hashed_token},
-            )
-            if spend_log is None:
-                return []
-            if isinstance(spend_log, list):
-                return spend_log
-            else:
-                return [spend_log]
-        elif request_id is not None:
-            spend_log = await prisma_client.get_data(
-                table_name="spend",
-                query_type="find_unique",
-                key_val={"key": "request_id", "value": request_id},
-            )
-            if spend_log is None:
-                return []
-            return [spend_log]
-        elif user_id is not None:
-            spend_log = await prisma_client.get_data(
-                table_name="spend",
-                query_type="find_all",
-                key_val={"key": "user", "value": user_id},
-            )
-            if spend_log is None:
-                return []
-            if isinstance(spend_log, list):
-                return spend_log
-            else:
-                return [spend_log]
         else:
-            spend_logs = await prisma_client.get_data(
-                table_name="spend", query_type="find_all"
-            )
+            scoped_filter: Dict[str, Any] = {}
+            if api_key is not None and isinstance(api_key, str):
+                if api_key.startswith("sk-"):
+                    hashed_token = prisma_client.hash_token(token=api_key)
+                else:
+                    hashed_token = api_key
+                scoped_filter["api_key"] = hashed_token
+            if request_id is not None and isinstance(request_id, str):
+                scoped_filter["request_id"] = request_id
+            if user_id is not None and isinstance(user_id, str):
+                scoped_filter["user"] = user_id
 
-            return spend_logs
+            if not scoped_filter:
+                spend_logs = await prisma_client.get_data(
+                    table_name="spend", query_type="find_all"
+                )
+                return spend_logs
+
+            data = await prisma_client.db.litellm_spendlogs.find_many(
+                where=scoped_filter,  # type: ignore
+                order={"startTime": "desc"},
+            )
+            return data
 
         return None
 
@@ -3080,7 +3079,11 @@ async def global_spend_models(
     return response
 
 
-@router.get("/provider/budgets", response_model=ProviderBudgetResponse)
+@router.get(
+    "/provider/budgets",
+    dependencies=[Depends(user_api_key_auth)],
+    response_model=ProviderBudgetResponse,
+)
 async def provider_budgets() -> ProviderBudgetResponse:
     """
     Provider Budget Routing - Get Budget, Spend Details https://docs.litellm.ai/docs/proxy/provider_budget_routing

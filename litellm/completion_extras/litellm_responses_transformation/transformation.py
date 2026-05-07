@@ -288,8 +288,10 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             if key in ("max_tokens", "max_completion_tokens"):
                 responses_api_request["max_output_tokens"] = value
             elif key == "tools" and value is not None:
-                responses_api_request["tools"] = self._convert_tools_to_responses_format(
-                    cast(List[Dict[str, Any]], value)
+                responses_api_request["tools"] = (
+                    self._convert_tools_to_responses_format(
+                        cast(List[Dict[str, Any]], value)
+                    )
                 )
             elif key == "response_format":
                 text_format = self._transform_response_format_to_text_format(value)
@@ -476,7 +478,11 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                         annotations=annotations,
                         reasoning_items=cast(
                             Optional[List[ChatCompletionReasoningItem]],
-                            [pending_reasoning_item] if pending_reasoning_item is not None else None,
+                            (
+                                [pending_reasoning_item]
+                                if pending_reasoning_item is not None
+                                else None
+                            ),
                         ),
                     )
 
@@ -536,7 +542,11 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                 reasoning_content=reasoning_content,
                 reasoning_items=cast(
                     Optional[List[ChatCompletionReasoningItem]],
-                    [pending_reasoning_item] if pending_reasoning_item is not None else None,
+                    (
+                        [pending_reasoning_item]
+                        if pending_reasoning_item is not None
+                        else None
+                    ),
                 ),
             )
             choices.append(Choices(message=msg, finish_reason="tool_calls", index=index))
@@ -1061,7 +1071,9 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                 )
 
                 if provider_specific_fields:
-                    function_chunk["provider_specific_fields"] = provider_specific_fields
+                    function_chunk["provider_specific_fields"] = (
+                        provider_specific_fields
+                    )
 
                 tool_call_index = parsed_chunk.get("output_index", 0)
                 tool_call_chunk = ChatCompletionToolCallChunk(
@@ -1126,7 +1138,9 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
 
                 # Add provider_specific_fields to function if present
                 if provider_specific_fields:
-                    function_chunk["provider_specific_fields"] = provider_specific_fields
+                    function_chunk["provider_specific_fields"] = (
+                        provider_specific_fields
+                    )
 
                 tool_call_index = parsed_chunk.get("output_index", 0)
                 tool_call_chunk = ChatCompletionToolCallChunk(
